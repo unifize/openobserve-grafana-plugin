@@ -1,10 +1,10 @@
 {
   "$schema": "https://raw.githubusercontent.com/grafana/grafana/master/docs/sources/developers/plugins/plugin.schema.json",
   "type": "datasource",
-  "name": "OpenObserve",
-  "id": "openobserve",
+  "name": "OpenObserve Logs",
+  "id": "openobserve-logs-datasource",
   "info": {
-    "description": "OpenObserve",
+    "description": "OpenObserve logs with native Explore context (V1)",
     "author": {
       "name": "OpenObserve"
     },
@@ -19,9 +19,9 @@
     "updated": "%TODAY%"
   },
   "dependencies": {
-    "grafanaDependency": "^9.3.8",
+    "grafanaDependency": ">=12.2.0 <13.0.0",
     "plugins": []
   },
   "logs": true,
-  "metrics": true
+  "metrics": false
 }

@@ -1,14 +1,52 @@
-version: '3.0'
-
+# Local V1 only. Override images/ports with environment variables or .env.
 services:
-  grafana:
-    container_name: 'openobserve'
-    build:
-      context: ./.config
-      args:
-        grafana_version: ${GRAFANA_VERSION:-9.3.8}
+  openobserve:
+    image: ${OPENOBSERVE_IMAGE:-public.ecr.aws/zinclabs/openobserve:v1.0.4}
+    environment:
+      ZO_ROOT_USER_EMAIL: demo@example.com
+      ZO_ROOT_USER_PASSWORD: LocalDemo123!
+      ZO_DATA_DIR: /data
+      ZO_LOCAL_MODE: 'true'
+      ZO_TELEMETRY: 'false'
     ports:
-      - 3000:3000/tcp
+      - '127.0.0.1:${OPENOBSERVE_PORT:-5080}:5080'
     volumes:
-      - ./dist:/var/lib/grafana/plugins/openobserve
-      - ./provisioning:/etc/grafana/provisioning
+      - openobserve-data:/data
+
+  seed:
+    image: python:${SEED_PYTHON_VERSION:-3.12.11-alpine3.22}
+    depends_on:
+      - openobserve
+    environment:
+      OPENOBSERVE_URL: http://openobserve:5080
+    entrypoint: ['python', '/demo/seed.py']
+    volumes:
+      - ./local/seed.py:/demo/seed.py:ro
+      - ./artifacts:/artifacts
+      - demo-state:/state
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana}:${GRAFANA_VERSION:-12.3.1}
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: LocalDemo123!
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: openobserve-logs-datasource
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: UTC
+    ports:
+      - '127.0.0.1:${GRAFANA_PORT:-3000}:3000'
+    volumes:
+      - ./dist:/var/lib/grafana/plugins/openobserve-logs-datasource:ro
+      - ./local/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  openobserve-data:
+  grafana-data:
+  demo-state:

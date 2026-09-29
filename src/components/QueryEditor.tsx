@@ -53,16 +53,21 @@ export const QueryEditor = ({ query, onChange, onRunQuery, datasource, app, data
           })),
         ]);
 
-        let seletedOrg: string = orgs.data[0].identifier;
-
-        if (isInDashboard && query.organization) {
-          seletedOrg = query.organization;
+        // Explore links can already specify an organization; don't load another org's schema.
+        const seletedOrg: string = query.organization || orgs.data[0]?.identifier;
+        if (!seletedOrg) {
+          return;
         }
 
         startLoading();
         setupStreams(seletedOrg)
           .then((streams: any) => {
-            datasource.updateStreamFields(streams[0].schema);
+            const selectedStream = streams.find((stream: any) => stream.name === query.stream) ?? streams[0];
+            if (!selectedStream) {
+              setStreamOptions([]);
+              return;
+            }
+            datasource.updateStreamFields(selectedStream.schema);
             setStreamOptions([
               ...Object.values(streams).map((stream: any) => ({
                 label: stream.name,
@@ -70,11 +75,11 @@ export const QueryEditor = ({ query, onChange, onRunQuery, datasource, app, data
               })),
             ]);
 
-            if (!(query.organization && query.stream && query.hasOwnProperty('sqlMode'))) {
+            if (!(query.organization && query.stream && Object.prototype.hasOwnProperty.call(query, 'sqlMode'))) {
               onChange({
                 ...query,
-                stream: streams[0].name,
-                organization: orgs.data[0].identifier,
+                stream: selectedStream.name,
+                organization: seletedOrg,
                 sqlMode: isInDashboard ? true : false,
                 displayMode: query.displayMode ?? 'auto'
               });

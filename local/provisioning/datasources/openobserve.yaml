@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: OpenObserve Logs local
+    uid: openobserve-logs-local
+    type: openobserve-logs-datasource
+    access: proxy
+    url: http://openobserve:5080
+    basicAuth: true
+    basicAuthUser: demo@example.com
+    secureJsonData:
+      basicAuthPassword: LocalDemo123!
+    jsonData:
+      timestamp_column: _timestamp
+    isDefault: false
+    editable: false
