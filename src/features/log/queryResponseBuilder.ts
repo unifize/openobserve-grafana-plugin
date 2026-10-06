@@ -123,6 +123,7 @@ export const getLogsDataFrame = (
       type: FieldType.time,
       config: {},
       values: [],
+      nanos: [],
     },
     {
       name: 'Content',
@@ -145,7 +146,9 @@ export const getLogsDataFrame = (
   // Populate field values
   data.forEach((log: any) => {
     fields[0].values.push(convertTimeToMs(log[timestampColumn])); // Time
-    fields[1].values.push(JSON.stringify(log)); // Content
+    // Grafana combines milliseconds + this sub-millisecond fraction for sorting/context.
+    fields[0].nanos!.push((Number(log[timestampColumn]) % 1000) * 1000);
+    fields[1].values.push(JSON.stringify(log)); // Retains original microseconds for context
 
     // Add stream field values
     streamFields.forEach((field: any, index: number) => {

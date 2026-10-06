@@ -8,7 +8,11 @@ import {
   SupplementaryQueryType,
   SupplementaryQueryOptions,
   LogLevel,
+  DataSourceWithLogsContextSupport,
+  LogRowModel,
+  LogRowContextOptions,
 } from '@grafana/data';
+import { createElement } from 'react';
 import { Observable } from 'rxjs';
 import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
 import { queryLogsVolume } from './features/log/LogsModel';
@@ -19,12 +23,14 @@ import { getOrganizations } from 'services/organizations';
 import { cloneDeep } from 'lodash';
 import { getGraphDataFrame, getLogsDataFrame } from 'features/log/queryResponseBuilder';
 import { buildQuery } from './features/query/queryBuilder';
+import { getLogContext, LogContextSource } from './features/log/logContext';
+import { LogContextNotice } from './features/log/LogContextNotice';
 
 const REF_ID_STARTER_LOG_VOLUME = 'log-volume-';
 
 export class DataSource
   extends DataSourceApi<MyQuery, MyDataSourceOptions>
-  implements DataSourceWithSupplementaryQueriesSupport<MyQuery>
+  implements DataSourceWithSupplementaryQueriesSupport<MyQuery>, DataSourceWithLogsContextSupport<MyQuery>
 {
   instanceSettings?: DataSourceInstanceSettings<MyDataSourceOptions>;
   url: string;
@@ -32,7 +38,6 @@ export class DataSource
   cachedLogsQuery: CachedQuery;
   cachedHistogramQuery: CachedQuery;
   timestampColumn: string;
-  histogramQuery: any;
   histogramTimestampColumn: string;
 
   constructor(instanceSettings: DataSourceInstanceSettings<MyDataSourceOptions>) {
@@ -52,8 +57,7 @@ export class DataSource
       data: null,
       promise: null,
     };
-    this.timestampColumn = instanceSettings.jsonData.timestamp_column;
-    this.histogramQuery = null;
+    this.timestampColumn = instanceSettings.jsonData.timestamp_column || '_timestamp';
     this.histogramTimestampColumn = "zo_sql_key"; // In histogram query response, we get zo_sql_key as timestamp column by default. Changing this will break things.
   }
 
@@ -61,6 +65,8 @@ export class DataSource
     return {
       ...query,
       query: getTemplateSrv().replace(query.query || '', scopedVars),
+      organization: getTemplateSrv().replace(query.organization || '', scopedVars),
+      stream: getTemplateSrv().replace(query.stream || '', scopedVars),
     };
   }
 
@@ -91,11 +97,8 @@ export class DataSource
     const isHistogramQuery = target?.refId?.includes(REF_ID_STARTER_LOG_VOLUME);
     let reqData = buildQuery(target, timestamps, this.streamFields, options.app, this.timestampColumn);
 
-    // Handle histogram query data preparation
-    if (!target.refId?.includes(REF_ID_STARTER_LOG_VOLUME)) {
-      this.histogramQuery = reqData;
-    } else if (target.refId?.includes(REF_ID_STARTER_LOG_VOLUME) && this.histogramQuery) {
-      reqData = this.histogramQuery;
+    // Build volume requests from their own target, not a shared last log query.
+    if (isHistogramQuery) {
       reqData.query.sql_mode = 'context';
       delete reqData.query.size;
     }
@@ -180,11 +183,13 @@ export class DataSource
    * Handles cache lookup and initialization for query requests
    * Returns the cached data if available, otherwise sets up a new cache entry
    */
-  private handleCacheManagement(target: MyQuery, reqData: any, options: DataQueryRequest<MyQuery>, isHistogramQuery: boolean): { currentCache: CachedQuery, shouldUseCachedData: boolean } {
+  private handleCacheManagement(target: MyQuery, reqData: any, _options: DataQueryRequest<MyQuery>, isHistogramQuery: boolean): { currentCache: CachedQuery, shouldUseCachedData: boolean } {
     let currentCache = isHistogramQuery ? this.cachedHistogramQuery : this.cachedLogsQuery;
 
     const cacheKey = JSON.stringify({
       reqData,
+      target,
+      timestampColumn: this.timestampColumn,
       displayMode: target.displayMode ?? 'auto',
       type: target.refId,
     });
@@ -206,6 +211,8 @@ export class DataSource
     currentCache.data = new Promise((resolve, reject) => {
       currentCache.promise = { resolve, reject };
     });
+    // The first caller observes the request itself; handle rejection even without a cache reader.
+    currentCache.data.catch(() => undefined);
 
     currentCache.requestQuery = cacheKey;
     currentCache.isFetching = true;
@@ -254,7 +261,7 @@ export class DataSource
    * Handles error scenarios and creates appropriate empty data frames
    * Resolves the cache promise with empty data and returns the data frame
    */
-  private handleQueryError(target: MyQuery, options: DataQueryRequest<MyQuery>, currentCache: CachedQuery, error?: any, timestampColumn?: string): any {
+  private handleQueryError(target: MyQuery, options: DataQueryRequest<MyQuery>, currentCache: CachedQuery, error?: any, _timestampColumn?: string): any {
     if (error) {
       console.error('Partition or histogram request failed:', error);
     }
@@ -322,7 +329,7 @@ export class DataSource
    */
   private processVolumeOrDashboardQuery(target: MyQuery, reqData: any, options: DataQueryRequest<MyQuery>, currentCache: CachedQuery): Promise<any> {
     // Remove size parameter for partition queries
-    if (reqData.query && reqData.query.hasOwnProperty('size')) {
+    if (reqData.query && Object.prototype.hasOwnProperty.call(reqData.query, 'size')) {
       delete reqData.query.size;
     }
 
@@ -340,14 +347,24 @@ export class DataSource
    * Handles response processing and error scenarios for logs queries
    */
   private processLogsQuery(target: MyQuery, reqData: any, currentCache: CachedQuery): Promise<any> {
+    const source: LogContextSource = {
+      target: cloneDeep(target),
+      sql: reqData.query.sql,
+      startTime: reqData.query.start_time,
+      endTime: reqData.query.end_time,
+      timestampColumn: this.timestampColumn,
+      streamFields: cloneDeep(target.streamFields ?? this.streamFields),
+    };
     return this.doRequest(target, reqData)
       .then((response) => {
-        const logsDataFrame = getLogsDataFrame(response.hits, target, this.streamFields, this.timestampColumn);
+        const logsDataFrame = getLogsDataFrame(response.hits ?? [], target, source.streamFields, source.timestampColumn);
+        logsDataFrame.meta = { ...logsDataFrame.meta, custom: { openobserveContext: source } };
         currentCache.promise?.resolve(logsDataFrame);
         return logsDataFrame;
       })
       .catch((err) => {
         currentCache.promise?.reject(err);
+        currentCache.data = null; // A failed request must be retryable.
         let error = {
           message: '',
           detail: '',
@@ -360,7 +377,7 @@ export class DataSource
           error.message = err.statusText;
         }
 
-        const customMessage = logsErrorMessage(err.data.code);
+        const customMessage = logsErrorMessage(err.data?.code);
         if (customMessage) {
           error.message = customMessage;
         }
@@ -372,9 +389,17 @@ export class DataSource
       });
   }
 
+  getLogRowContext(row: LogRowModel, options: LogRowContextOptions = {}): Promise<DataQueryResponse> {
+    return getLogContext(row, options, (target, request) => this.doRequest(target, request));
+  }
+
+  getLogRowContextUi(row: LogRowModel) {
+    return createElement(LogContextNotice, { row });
+  }
+
   async testDatasource() {
     return getOrganizations({ url: this.url })
-      .then((res) => {
+      .then(() => {
         return {
           status: 'success',
           message: 'Data source successfully connected.',
@@ -440,7 +465,7 @@ export class DataSource
     // return [SupplementaryQueryType.LogsVolume, SupplementaryQueryType.LogsSample];
   }
 
-  getSupplementaryQuery(options: SupplementaryQueryOptions, originalQuery: MyQuery): MyQuery | undefined {
+  getSupplementaryQuery(_options: SupplementaryQueryOptions, _originalQuery: MyQuery): MyQuery | undefined {
     return undefined;
   }
 

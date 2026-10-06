@@ -1,6 +1,6 @@
 {
   "name": "openobserve-grafana-plugin",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "OpenObserve Grafana Plugin",
   "scripts": {
     "build": "webpack -c ./.config/webpack/webpack.config.ts --env production",
@@ -12,7 +12,7 @@
     "lint:fix": "npm run lint --fix",
     "e2e": "npm exec cypress install && npm exec grafana-e2e run",
     "e2e:update": "npm exec cypress install && npm exec grafana-e2e run --update-screenshots",
-    "server": "docker-compose up --build",
+    "server": "docker compose up -d",
     "sign": "npx --yes @grafana/sign-plugin@latest"
   },
   "author": "OpenObserve",

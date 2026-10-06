@@ -1,0 +1,16 @@
+# Optional LOCAL comparison; requires the preserved snapshots in artifacts/.
+# docker compose -f docker-compose.yaml -f local/compose.side-by-side.yaml up -d
+services:
+  grafana:
+    environment:
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: >-
+        openobserve,openobserve-logs-datasource
+    volumes:
+      - type: bind
+        source: ./artifacts/openobserve-existing-plugin
+        target: /var/lib/grafana/plugins/openobserve
+        read_only: true
+      - type: bind
+        source: ./artifacts/side-by-side-provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
