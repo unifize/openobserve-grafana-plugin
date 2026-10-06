@@ -10,13 +10,15 @@ import { MyQuery } from '../../types';
 import { ContextIdentity, contextSql, parseContextScope } from './contextQuery';
 import { getLogsDataFrame } from './queryResponseBuilder';
 
-export const CONTEXT_LIMIT = 100;
+export const CONTEXT_WINDOW_MICROS = 60_000_000;
 export const CONTEXT_NOTE =
-  `V1: at most ${CONTEXT_LIMIT} earlier and ${CONTEXT_LIMIT} later records within the original Explore range. ` +
-  'Context matches only the selected row’s deployment_environment and service_name, across pods. Original SQL filters are ignored. ' +
+  'All matching logs from 60 seconds before through 60 seconds after the selected log, including outside the Explore range. ' +
+  'Context matches the selected row’s deployment_environment and service_name, plus kubernetes_pod_name when available. ' +
+  'Original SQL filters are ignored. No row cap is applied. ' +
   'Neighbors show body only; the highlighted line keeps its original Explore display. ' +
-  'Equal-time order is unspecified; projection-identical peers retain separate occurrences. ' +
-  '“No more logs available” can mean the V1 cap. If a wrapped matched line covers the view, unpin it or use the jump buttons.';
+  'Select Oldest first in Explore for earlier logs above and later logs below. ' +
+  'Timestamps retain microsecond precision; equal-time order is unspecified and repeated occurrences are retained. ' +
+  'If a wrapped matched line covers the view, unpin it or use the jump buttons.';
 
 type LogRecord = Record<string, unknown>;
 type Search = (target: MyQuery, request: unknown) => Promise<{ hits?: LogRecord[]; is_partial?: boolean }>;
@@ -110,7 +112,16 @@ function selectedRecord(
         'Context was not fetched because searching without both would mix unrelated environments or services.'
     );
   }
-  return { record, timestamp, identity: { deployment_environment: environment, service_name: service } };
+  const pod = record.kubernetes_pod_name;
+  return {
+    record,
+    timestamp,
+    identity: {
+      deployment_environment: environment,
+      service_name: service,
+      ...(typeof pod === 'string' && pod.trim() ? { kubernetes_pod_name: pod } : {}),
+    },
+  };
 }
 
 export function contextProblem(row: LogRowModel): string | undefined {
@@ -124,7 +135,11 @@ export function contextProblem(row: LogRowModel): string | undefined {
   }
 }
 
-function projectContextRecord(record: LogRecord, timestampColumn: string): LogRecord {
+export function contextUsesPod(row: LogRowModel): boolean {
+  return selectedRecord(row, contextSource(row)).identity.kubernetes_pod_name !== undefined;
+}
+
+function projectContextRecord(record: LogRecord, timestampColumn: string, includePod: boolean): LogRecord {
   const raw = record[timestampColumn];
   const timestamp = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : raw;
   if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp)) {
@@ -138,70 +153,80 @@ function projectContextRecord(record: LogRecord, timestampColumn: string): LogRe
     body: record.body ?? null,
     deployment_environment: record.deployment_environment,
     service_name: record.service_name,
+    ...(includePod ? { kubernetes_pod_name: record.kubernetes_pod_name } : {}),
   };
+}
+
+/** No total row cap. Re-fetching avoids OFFSET/cursor gaps across timestamp ties.
+ * OpenObserve size:-1 is NOT unlimited: it silently applies its default limit
+ * (with is_partial). Explicit positive sizes bypass that default on v1.0.4.
+ * Use only the final complete response, never merge changing result prefixes.
+ */
+async function fetchAll(
+  target: MyQuery,
+  query: { sql: string; sql_mode: string; start_time: number; end_time: number },
+  search: Search
+): Promise<LogRecord[]> {
+  for (let size = 1000; ; size *= 2) {
+    const response = await search(target, { query: { ...query, size } });
+    if (response.is_partial) {
+      throw new Error('OpenObserve returned partial context. The complete 120-second window could not be loaded. Retry the request.');
+    }
+    if (response.hits !== undefined && !Array.isArray(response.hits)) {
+      throw new Error('OpenObserve returned an invalid context response.');
+    }
+    const hits = response.hits ?? [];
+    if (hits.length < size) {
+      return hits;
+    }
+  }
 }
 
 async function fetchWindow(row: LogRowModel, source: LogContextSource, search: Search): Promise<ContextWindow> {
   const scope = parseContextScope(source.sql);
   const { record, timestamp, identity } = selectedRecord(row, source);
-  const selected = projectContextRecord(record, source.timestampColumn);
-  const fetch = async (comparison: '<' | '>' | '=', limit: number) => {
-    const response = await search(source.target, {
-      query: {
-        sql: contextSql(scope, identity, source.timestampColumn, timestamp, comparison, limit),
-        sql_mode: 'full',
-        start_time: source.startTime,
-        end_time: source.endTime,
-        size: limit,
-      },
-    });
-    if (response.is_partial) {
-      throw new Error('OpenObserve returned partial context. Narrow the original time range and retry.');
-    }
-    if (response.hits !== undefined && !Array.isArray(response.hits)) {
-      throw new Error('OpenObserve returned an invalid context response.');
-    }
-    return (response.hits ?? []).map((hit) => {
-      const projected = projectContextRecord(hit, source.timestampColumn);
-      const time = projected[source.timestampColumn] as number;
-      if (
-        projected.deployment_environment !== identity.deployment_environment ||
-        projected.service_name !== identity.service_name ||
-        time < source.startTime ||
-        time >= source.endTime
-      ) {
-        throw new Error('OpenObserve returned context outside the selected environment, service, or time range.');
-      }
-      return projected;
-    });
-  };
-  // Strict sides plus a separate equality bucket avoid skipping same-microsecond records.
-  // One lookahead detects an overflowing tie bucket instead of silently truncating it.
-  const [earlier, later, equal] = await Promise.all([
-    fetch('<', CONTEXT_LIMIT),
-    fetch('>', CONTEXT_LIMIT),
-    fetch('=', CONTEXT_LIMIT + 2),
-  ]);
-  if (equal.length > CONTEXT_LIMIT + 1) {
-    throw new Error(
-      `More than ${CONTEXT_LIMIT} peers share this timestamp. V1 cannot select a complete tie group without a stable record ID. Choose another log timestamp; changing SQL filters cannot reduce this context group.`
-    );
+  const includePod = identity.kubernetes_pod_name !== undefined;
+  const selected = projectContextRecord(record, source.timestampColumn, includePod);
+  const startTime = timestamp - CONTEXT_WINDOW_MICROS;
+  // OpenObserve's end is exclusive. Include the exact +60-second microsecond.
+  const endTime = timestamp + CONTEXT_WINDOW_MICROS + 1;
+  if (!Number.isSafeInteger(startTime) || !Number.isSafeInteger(endTime)) {
+    throw new Error('The context window exceeds safe-integer microsecond precision.');
   }
-  const selectedIndex = equal.findIndex((hit) => isEqual(hit, selected));
+  const hits = await fetchAll(source.target, {
+    sql: contextSql(scope, identity, source.timestampColumn),
+    sql_mode: 'full',
+    start_time: startTime,
+    end_time: endTime,
+  }, search);
+  const records = hits.map((hit) => {
+    const projected = projectContextRecord(hit, source.timestampColumn, includePod);
+    const time = projected[source.timestampColumn] as number;
+    if (
+      projected.deployment_environment !== identity.deployment_environment ||
+      projected.service_name !== identity.service_name ||
+      (includePod && projected.kubernetes_pod_name !== identity.kubernetes_pod_name) ||
+      time < startTime ||
+      time >= endTime
+    ) {
+      throw new Error('OpenObserve returned context outside the selected environment, service, pod, or time window.');
+    }
+    return projected;
+  });
+  records.sort((a, b) => (a[source.timestampColumn] as number) - (b[source.timestampColumn] as number));
+  const selectedIndex = records.findIndex((hit) => isEqual(hit, selected));
   if (selectedIndex === -1) {
     throw new Error('The selected log was not found in the context response. Rerun the Explore query and retry.');
   }
-  // Projection hides other metadata: identical tuples are interchangeable, not
-  // deduplicated. Remove exactly one occurrence for the native highlighted row.
-  const peers = equal.filter((_, index) => index !== selectedIndex);
-  if (peers.length > CONTEXT_LIMIT) {
-    throw new Error('The equal-timestamp group exceeds the V1 context limit; no records were silently discarded.');
-  }
-  return {
-    before: [...earlier.slice(0, CONTEXT_LIMIT - peers.length).reverse(), ...peers],
-    after: later,
-    selected,
-  };
+  const before: LogRecord[] = [];
+  const after: LogRecord[] = [];
+  records.forEach((hit, index) => {
+    // Remove exactly one occurrence; never collapse identical physical records.
+    if (index !== selectedIndex) {
+      ((hit[source.timestampColumn] as number) <= timestamp ? before : after).push(hit);
+    }
+  });
+  return { before, after, selected };
 }
 
 function failureMessage(error: unknown): string {
@@ -220,7 +245,7 @@ function contextFrame(
   source: LogContextSource,
   direction: LogRowContextQueryDirection
 ): DataFrame {
-  const metadataFields = [...new Set([source.timestampColumn, 'deployment_environment', 'service_name'])]
+  const metadataFields = Object.keys(window.selected)
     .filter((name) => name !== 'body')
     .map((name) => ({ name, type: name === source.timestampColumn ? 'Int64' : 'Utf8' }));
   const frame = getLogsDataFrame(
@@ -250,8 +275,8 @@ export async function getLogContext(
   options: LogRowContextOptions,
   search: Search
 ): Promise<DataQueryResponse> {
-  // Grafana auto-pages from boundary rows. Do not issue a new moving window:
-  // the notice explicitly distinguishes this V1 cap from exhaustion of the stream.
+  // The full fixed window is already loaded. Native boundary auto-paging must
+  // not move the anchor or fetch records beyond its +/-60-second bounds.
   if (row.dataFrame.meta?.custom?.openobserveContextPage) {
     return { data: [] };
   }

@@ -1,5 +1,7 @@
 """Seed the local Compose demo; standard library only, not a test suite."""
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -15,7 +17,7 @@ if urllib.parse.urlparse(URL).scheme not in ("http", "https"):
     raise ValueError("OPENOBSERVE_URL must use http or https")
 AUTH = base64.b64encode(b"demo@example.com:LocalDemo123!").decode()
 STATE = Path("/state/demo.json")
-FIXTURE_VERSION = 4
+FIXTURE_VERSION = 5
 
 
 def request(path, payload=None):
@@ -43,13 +45,13 @@ def seed():
     end = (anchor // 1_000_000 + 120) * 1_000_000
     logs = []
 
-    def add(timestamp, message, pod="checkout-a", environment="context-demo",
+    def add(timestamp, message, pod: str | None = "checkout-a", environment="context-demo",
             service="checkout", **extra):
         logs.append({
             "_timestamp": timestamp,
             "deployment_environment": environment,
             "service_name": service,
-            "pod": pod,
+            "kubernetes_pod_name": pod,
             "severity": "ERROR" if message.startswith("CONTEXT_ANCHOR:") else "INFO",
             "body": message,
             **extra,
@@ -70,7 +72,24 @@ def seed():
         add(anchor + offset * 1_000_000, message,
             pod=["checkout-a", "checkout-b", "checkout-c"][offset % 3], **extra)
     # Same projected tuple, different original metadata: retain its occurrence.
-    add(anchor, "CONTEXT_ANCHOR: checkout accepted", pod="checkout-b")
+    add(anchor, "CONTEXT_ANCHOR: checkout accepted", pod="checkout-a")
+    # Uncapped context: exceed both the old 201 rows and common 1000-row defaults.
+    for offset in range(1, 601):
+        add(anchor - offset, f"DENSE_BEFORE {offset:04d}")
+        add(anchor + offset, f"DENSE_AFTER {offset:04d}")
+    for _ in range(150):
+        add(anchor, "IDENTICAL_TIE: retain every occurrence")
+    for offset, message in [
+        (-60_000_001, "OUTSIDE_CONTEXT_START"),
+        (-60_000_000, "AT_CONTEXT_START"),
+        (60_000_000, "AT_CONTEXT_END"),
+        (60_000_001, "OUTSIDE_CONTEXT_END"),
+    ]:
+        add(anchor + offset, message)
+    add(anchor + 2, "POD_FALLBACK_ANCHOR", pod=None)
+    # Separate service for API verification beyond a typical backend 10k default.
+    for offset in range(12_050):
+        add(anchor + offset, f"UNLIMITED_API {offset:05d}", service="dense-window")
     add(anchor + 52_000_000, "", pod="checkout-c")
     add(anchor, "EQUAL_TIMESTAMP: different pod", pod="checkout-b")
     add(anchor, "EQUAL_TIMESTAMP: different pod", pod="checkout-c")
@@ -98,8 +117,14 @@ def seed():
     sql = ('SELECT * FROM "default" WHERE '
            "deployment_environment = 'context-demo' "
            "AND service_name = 'checkout'")
+    context_records = [record for record in logs
+                       if record["deployment_environment"] == "context-demo"
+                       and record["service_name"] == "checkout"
+                       and record["kubernetes_pod_name"] == "checkout-a"
+                       and abs(record["_timestamp"] - anchor) <= 60_000_000]
     return {
         "fixture_version": FIXTURE_VERSION,
+        "expected_pod_context_records": len(context_records),
         "sql": sql, "from": iso(start), "to": iso(end),
         "anchor_microseconds": anchor,
         "event": "CONTEXT_ANCHOR: checkout accepted",

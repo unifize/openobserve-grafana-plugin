@@ -5,10 +5,22 @@
 Standalone logs datasource with native Grafana Explore context (V1).
 Plugin ID: `openobserve-logs-datasource`. Install alongside `openobserve` and use
 it through a new datasource; existing logs/metrics datasources are not replaced.
-Context uses `deployment_environment` and `service_name` from the selected log,
-not the SQL. Original SQL filters are ignored, so surrounding logs can differ in
-message, severity, and pod. Up to 100 records before and 100 after are shown
-inside the original Explore time range and source stream.
+Context uses `deployment_environment`, `service_name`, and (when present)
+`kubernetes_pod_name` from the selected log, never from the SQL. Without a valid
+pod, it falls back to environment/service with a visible cross-pod notice.
+Original SQL filters are ignored, so surrounding logs can differ in message and
+severity. All matching records from **60 seconds before through 60 seconds after**
+the selected log are loaded, including outside the original Explore range. Both
+endpoints are inclusive. There is no row cap or additional volume guardrail in V1.
+
+Context searches use explicit result sizes, starting at 1,000 and doubling only
+when a response is full. Only the final complete response is used; no offset or
+timestamp cursor can skip identical occurrences. `size: -1` is not used because
+OpenObserve applies its default limit. Results use the exact timestamp ascending.
+The native viewer keeps the selected log centered
+and retains Explore's display order: select **Oldest first** in Explore for earlier
+logs above and later logs below. Timestamps retain microsecond precision. Large
+windows may take longer and consume significant backend/browser memory.
 
 Context queries select `body` plus exact timestamp and scope metadata. Only
 neighboring lines display body; the highlighted original line and main Explore

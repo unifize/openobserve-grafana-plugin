@@ -7,6 +7,7 @@ export interface ContextScope {
 export interface ContextIdentity {
   deployment_environment: string;
   service_name: string;
+  kubernetes_pod_name?: string;
 }
 
 const UNSUPPORTED =
@@ -75,24 +76,22 @@ export function parseContextScope(sql: string): ContextScope {
 export function contextSql(
   scope: ContextScope,
   identity: ContextIdentity,
-  timestampColumn: string,
-  timestamp: number,
-  comparison: '<' | '>' | '=',
-  limit: number
+  timestampColumn: string
 ): string {
   const field = `"${timestampColumn.replace(/"/g, '""')}"`;
   // Keep exact time and scope as metadata; only body is rendered as the context line.
-  const columns = [...new Set([timestampColumn, 'body', 'deployment_environment', 'service_name'])]
+  const scopeFields = ['deployment_environment', 'service_name'] as Array<keyof ContextIdentity>;
+  // A stream without pod metadata may not even have this column in its schema.
+  if (identity.kubernetes_pod_name !== undefined) {
+    scopeFields.push('kubernetes_pod_name');
+  }
+  const columns = [...new Set([timestampColumn, 'body', ...scopeFields])]
     .map((column) => `"${column.replace(/"/g, '""')}"`)
     .join(', ');
-  // Both values come only from the clicked record, never the query text.
-  // Deliberately omit every original SQL filter, including pod/message/severity.
-  // These are log values, not SQL: escape single quotes without changing their contents.
-  const environment = identity.deployment_environment.replace(/'/g, "''");
-  const service = identity.service_name.replace(/'/g, "''");
-  const selectedScope = `"deployment_environment" = '${environment}' AND "service_name" = '${service}'`;
-  return (
-    `SELECT ${columns} FROM ${scope.from} WHERE ${selectedScope} AND ${field} ${comparison} ${timestamp}\n` +
-    `ORDER BY ${field} ${comparison === '<' ? 'DESC' : 'ASC'} LIMIT ${limit}`
-  );
+  // Rebuild scope exclusively from the clicked record. Never reuse SQL filters.
+  const selectedScope = scopeFields
+    .map((column) => `"${column}" = '${identity[column]!.replace(/'/g, "''")}'`)
+    .join(' AND ');
+  // API bounds supply the fixed window; the caller grows size until complete.
+  return `SELECT ${columns} FROM ${scope.from} WHERE ${selectedScope}\nORDER BY ${field} ASC`;
 }
